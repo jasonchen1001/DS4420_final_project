@@ -1,32 +1,16 @@
-"""
-Enhanced Multilayer Perceptron for Breast Cancer Survival Prediction
-DS4420 Final Project - Phase II
-
-Dependencies: numpy, pandas (optional: json for config).
-"""
-
 import math
 import json
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
-# =============================================================================
-# Labels & metrics & CV
-# =============================================================================
-
-
+# Survival long/short labels
 def survival_long_short_labels(df):
-    """
-    Long vs short from OS.time (median split), aligned with data_preprocess.create_label.
-    1 = long (strictly above median), 0 = short.
-    """
     threshold = df["OS.time"].median()
     y = (df["OS.time"] > threshold).astype(int).values
     return y, float(threshold)
 
-
+# Confusion matrix for binary classification
 def confusion_matrix_binary(y_true, y_pred):
     y_true = np.asarray(y_true).astype(int)
     y_pred = np.asarray(y_pred).astype(int)
@@ -36,13 +20,13 @@ def confusion_matrix_binary(y_true, y_pred):
     fn = int(np.sum((y_true == 1) & (y_pred == 0)))
     return np.array([[tn, fp], [fn, tp]], dtype=float)
 
-
+# Accuracy score for binary classification
 def accuracy_score_np(y_true, y_pred):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     return float(np.mean(y_true == y_pred))
 
-
+# Precision score for binary classification
 def precision_score_np(y_true, y_pred):
     y_true = np.asarray(y_true).astype(int)
     y_pred = np.asarray(y_pred).astype(int)
@@ -53,6 +37,7 @@ def precision_score_np(y_true, y_pred):
     return float(tp / (tp + fp))
 
 
+# Recall score for binary classification
 def recall_score_np(y_true, y_pred):
     y_true = np.asarray(y_true).astype(int)
     y_pred = np.asarray(y_pred).astype(int)
@@ -63,6 +48,7 @@ def recall_score_np(y_true, y_pred):
     return float(tp / (tp + fn))
 
 
+# F1 score for binary classification
 def f1_score_np(y_true, y_pred):
     p = precision_score_np(y_true, y_pred)
     r = recall_score_np(y_true, y_pred)
@@ -71,15 +57,14 @@ def f1_score_np(y_true, y_pred):
     return float(2 * p * r / (p + r))
 
 
+# Integrate trapezoid for ROC AUC score
 def _integrate_trapezoid(y, x):
-    """Trapezoid rule; prefers numpy.trapezoid (NumPy 2+), else trapz."""
     if hasattr(np, "trapezoid"):
         return float(np.trapezoid(y, x))
     return float(np.trapz(y, x))
 
-
+# ROC AUC score for binary classification
 def roc_auc_score_binary(y_true, y_score):
-    """Area under ROC curve (trapezoid), binary labels in {0,1}."""
     y_true = np.asarray(y_true).astype(int)
     y_score = np.asarray(y_score).astype(float)
     n_pos = np.sum(y_true == 1)
@@ -94,18 +79,14 @@ def roc_auc_score_binary(y_true, y_score):
     fpr = np.concatenate([[0.0], fps / n_neg])
     return _integrate_trapezoid(tpr, fpr)
 
-
+# Scale train and validation sets
 def scale_train_val(X_train, X_val):
-    """Z-score using training fold only (no leakage to validation)."""
     mean = X_train.mean(axis=0)
     std = X_train.std(axis=0) + 1e-8
     return (X_train - mean) / std, (X_val - mean) / std
 
-
+# Stratified k-fold indices
 def stratified_k_fold_indices(y, n_folds, seed):
-    """
-    Return list of (train_idx, val_idx) with stratification by class.
-    """
     y = np.asarray(y).astype(int)
     rng = np.random.default_rng(seed)
     n = len(y)
@@ -128,76 +109,22 @@ def stratified_k_fold_indices(y, n_folds, seed):
         splits.append((train_idx, val_idx))
     return splits
 
-
-# =============================================================================
-# Data Loading and Preprocessing
-# =============================================================================
-
-
-def load_data(csv_path, test_ratio=0.2, seed=42, feature_names=None):
-    """
-    Load multimodal table; label = long/short from OS.time median (not OS event).
-    Returns raw features (no global standardization — fit scaler on train splits as needed).
-    """
-    df = pd.read_csv(csv_path)
-    y, _ = survival_long_short_labels(df)
-
-    drop = [
-        "sample",
-        "OS",
-        "OS.time",
-        "sampleID_x",
-        "sampleID_y",
-        "sampleID",
-        "ER.Status",
-        "PR.Status",
-        "HER2.Final.Status",
-        "age_at_initial_pathologic_diagnosis",
-    ]
-    X = df.drop(columns=[c for c in drop if c in df.columns])
-    X = X.select_dtypes(include=[np.number])
-    X = X.fillna(X.mean())
-
-    if feature_names is not None:
-        available_features = [f for f in feature_names if f in X.columns]
-        if len(available_features) > 0:
-            X = X[available_features]
-            print(f"Using {len(available_features)} selected features")
-
-    X = X.to_numpy(dtype=float)
-
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(len(X))
-    X, y = X[idx], y[idx]
-
-    n_test = int(len(X) * test_ratio)
-    print(f"train: {len(X)-n_test}, test: {n_test}")
-
-    return X[n_test:], y[n_test:], X[:n_test], y[:n_test]
-
-
+# Select top k features by variance
 def select_features_by_variance(X, k=100, feature_names=None):
-    """Select top k features by variance."""
     variances = np.var(X, axis=0)
     top_indices = np.argsort(variances)[-k:][::-1]
     return top_indices
 
-
+# Select top k features by univariate correlation with target
 def select_features_univariate(X, y, k=100):
-    """Select top k features by univariate correlation with target."""
     correlations = np.array([np.corrcoef(X[:, j], y)[0, 1] for j in range(X.shape[1])])
     correlations = np.nan_to_num(correlations)
     top_indices = np.argsort(np.abs(correlations))[-k:][::-1]
     return top_indices
 
 
-# =============================================================================
 # MLP Implementation with Regularization
-# =============================================================================
-
-
 class MLP:
-    """Multilayer Perceptron with support for multiple architectures."""
 
     def __init__(
         self,
@@ -330,11 +257,7 @@ class MLP:
         return activations[-1].flatten()
 
 
-# =============================================================================
 # Evaluation Metrics
-# =============================================================================
-
-
 def compute_metrics(y_true, y_pred, y_proba=None):
     metrics = {
         "accuracy": accuracy_score_np(y_true, y_pred),
@@ -352,19 +275,8 @@ def compute_metrics(y_true, y_pred, y_proba=None):
     return metrics
 
 
-# =============================================================================
-# Cross-Validation
-# =============================================================================
-
-
+# Cross-validate MLP model
 def cross_validate(X, y, config, n_folds=5, seed=42, already_normalized=False):
-    """
-    Stratified k-fold CV. By default, fits mean/std on each training fold only.
-    Set ``already_normalized=True`` if X (e.g. preprocessed CSV) is already z-scored.
-
-    Optional ``config['n_features_select']``: if set and smaller than n_cols, selects
-    top features **using training fold only** (variance or univariate), then scales.
-    """
     y = np.asarray(y)
     splits = stratified_k_fold_indices(y, n_folds, seed)
 
@@ -442,12 +354,10 @@ def cross_validate(X, y, config, n_folds=5, seed=42, already_normalized=False):
             val_losses.append(val_loss)
 
             if (epoch + 1) % 10 == 0:
-                y_train_pred = model.predict(X_train)
                 y_val_pred = model.predict(X_val)
-                train_acc = accuracy_score_np(y_train, y_train_pred)
                 val_acc = accuracy_score_np(y_val, y_val_pred)
                 print(
-                    f"  Epoch {epoch+1:3d} | Train Loss: {train_losses[-1]:.4f} | "
+                    f" Epoch {epoch+1:3d} | Train Loss: {train_losses[-1]:.4f} | "
                     f"Val Loss: {val_losses[-1]:.4f} | Val Acc: {val_acc:.4f}"
                 )
 
@@ -495,12 +405,7 @@ def cross_validate(X, y, config, n_folds=5, seed=42, already_normalized=False):
 
     return agg_metrics, all_fold_results
 
-
-# =============================================================================
 # Main Training Function
-# =============================================================================
-
-
 def _read_feature_names(path):
     path = Path(path)
     if not path.is_file():
@@ -508,18 +413,8 @@ def _read_feature_names(path):
     with open(path, encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
 
-
+# Train MLP model
 def train_model(config_path=None):
-    """
-    Train MLP with stratified CV.
-
-    Default: loads preprocessed ``mlp_train.csv`` (long/short label column ``y``,
-    features already z-scored in preprocessing — CV skips per-fold scaling).
-
-    Alternative: set ``use_preprocessed_train``: false to read ``brca_multimodal.csv``,
-    build labels from ``OS.time`` median, optional ``mlp_features.txt`` column subset,
-    then per-fold scaling (and optional per-fold top-k selection via ``n_features``).
-    """
     model_dir = Path(__file__).resolve().parent
     project_root = model_dir.parent
     data_dir = project_root / "data"
@@ -553,15 +448,8 @@ def train_model(config_path=None):
             },
         }
 
-    print("=" * 60)
     print("Enhanced MLP for Breast Cancer Survival Prediction")
-    print("=" * 60)
-    print("\nConfiguration:")
-    print(json.dumps(config, indent=2))
-
-    print("\n" + "=" * 60)
-    print("Loading Data")
-    print("=" * 60)
+    print("Configuration loaded.")
 
     data_cfg = config["data"]
     use_pre = data_cfg.get("use_preprocessed_train", True)
@@ -624,9 +512,7 @@ def train_model(config_path=None):
         f"Class distribution: 0: {int(np.sum(y==0))}, 1: {int(np.sum(y==1))}"
     )
 
-    print("\n" + "=" * 60)
     print("Running Cross-Validation")
-    print("=" * 60)
 
     agg_metrics, fold_results = cross_validate(
         X,
@@ -636,10 +522,7 @@ def train_model(config_path=None):
         seed=data_cfg["seed"],
         already_normalized=already_normalized,
     )
-
-    print("\n" + "=" * 60)
-    print("Saving Results (no matplotlib: figures not generated)")
-    print("=" * 60)
+    print("Saving Results")
 
     results_dir.mkdir(parents=True, exist_ok=True)
     cv_path = results_dir / "mlp_cv_results.csv"
@@ -660,14 +543,12 @@ def train_model(config_path=None):
     metrics_df = pd.DataFrame([agg_metrics])
     metrics_df.to_csv(summary_path, index=False)
 
-    print("\n" + "=" * 60)
     print("Results Saved")
-    print("=" * 60)
     print(f"- CV results: {cv_path}")
     print(f"- Metrics summary: {summary_path}")
 
     return agg_metrics, fold_results
 
-
+# Main function
 if __name__ == "__main__":
     train_model()

@@ -6,22 +6,15 @@ from sklearn.model_selection import train_test_split
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-
+# Load raw BRCA dataset
 def load_raw_data():
-    """Load raw BRCA dataset"""
     path = os.path.join(PROJECT_ROOT, "data", "brca_multimodal.csv")
     df = pd.read_csv(path)
     print(f"Loaded data: {df.shape}")
     return df
 
-
+# Create long/short labels
 def create_label(df):
-    """
-    Create binary label from survival time.
-
-    1 = long survival (above median)
-    0 = short survival (below median)
-    """
     threshold = df["OS.time"].median()
     y = (df["OS.time"] > threshold).astype(int).values
 
@@ -30,14 +23,8 @@ def create_label(df):
 
     return y
 
-
+# Separate gene features and protein features.
 def split_features(df):
-    """
-    Separate gene features and protein features.
-
-    Protein columns are uppercase (AKT, EGFR, etc.)
-    Gene columns are the rest.
-    """
     drop_cols = ["sample", "OS", "OS.time", "sampleID_x", "sampleID_y", "sampleID"]
     X_df = df.drop(columns=[c for c in drop_cols if c in df.columns])
     X_df = X_df.select_dtypes(include=[np.number])
@@ -47,18 +34,9 @@ def split_features(df):
 
     return X_df, gene_cols, protein_cols
 
-
+# Preprocess data for MLP model
 def preprocess_for_mlp(df, n_features=500, test_size=0.2, seed=42):
-    """
-    Prepare data for MLP.
-
-    Pipeline:
-    - binary label from OS.time (median split: long=1, short=0)
-    - stratified train/test split
-    - select top ``n_features`` columns by variance (computed on train only)
-    - normalize using train mean/std
-    """
-    print("\n=== MLP preprocessing ===")
+    print(" MLP preprocessing")
 
     y = create_label(df)
 
@@ -127,17 +105,9 @@ def preprocess_for_mlp(df, n_features=500, test_size=0.2, seed=42):
         "features": feature_names
     }
 
-
+# Prepare data for Cox model.
 def preprocess_for_cox(df, n_gene_features=400):
-    """
-    Prepare data for Cox model.
-
-    Keep:
-    - OS (event)
-    - OS.time (time)
-    - selected gene + all protein
-    """
-    print("\n=== Cox preprocessing ===")
+    print(" Cox preprocessing")
 
     y = df["OS"].values.astype(float)
     t = df["OS.time"].values
@@ -188,13 +158,13 @@ def preprocess_for_cox(df, n_gene_features=400):
         "features": feature_names
     }
 
-
+# Main function
 def main():
     df = load_raw_data()
     preprocess_for_mlp(df)
     preprocess_for_cox(df)
     print("\nDone.")
 
-
+# Main function
 if __name__ == "__main__":
     main()
