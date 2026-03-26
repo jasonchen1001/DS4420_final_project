@@ -6,11 +6,8 @@
 library(dplyr)
 library(ggplot2)
 
-# =============================================================================
-# Data Loading and Preprocessing
-# =============================================================================
 
-load_survival_data <- function(csv_path = "../data/brca_multimodal.csv",
+load_survival_data <- function(csv_path = "/Users/chenyanzhen/Documents/DS4420_final_project-2/data/brca_multimodal.csv",
                                 n_features = 100,
                                 seed = 42) {
   # Load data
@@ -49,9 +46,6 @@ load_survival_data <- function(csv_path = "../data/brca_multimodal.csv",
        feature_names = colnames(X_matrix), n = nrow(X_matrix), p = ncol(X_matrix))
 }
 
-# =============================================================================
-# Cox Partial Likelihood Functions
-# =============================================================================
 
 # Compute log partial likelihood for Cox model
 log_partial_likelihood <- function(beta, X, time, status) {
@@ -107,18 +101,12 @@ gradient_log_likelihood <- function(beta, X, time, status, eps = 1e-8) {
   return(grad)
 }
 
-# =============================================================================
-# Prior Functions
-# =============================================================================
 
 # Log prior for coefficients (Normal(0, sigma^2))
 log_prior <- function(beta, sigma = 10) {
   sum(dnorm(beta, mean = 0, sd = sigma, log = TRUE))
 }
 
-# =============================================================================
-# Metropolis-Hastings MCMC
-# =============================================================================
 
 # Single Metropolis-Hastings step for one parameter
 mh_step <- function(beta, X, time, status, idx, step_size, sigma_prior = 10) {
@@ -174,7 +162,7 @@ adaptive_mcmc <- function(X, time, status,
   # Track acceptance rates
   accept_count <- rep(0, p)
 
-  cat("Running MCMC...\n")
+  cat("Running MCMC...")
   for (iter in 1:n_iter) {
     # Update each parameter sequentially
     for (j in 1:p) {
@@ -203,12 +191,12 @@ adaptive_mcmc <- function(X, time, status,
     # Progress report
     if (iter %% 1000 == 0) {
       overall_accept <- sum(accept_count) / (iter * p)
-      cat(sprintf("Iteration %d/%d, Acceptance rate: %.3f\n",
+      cat(sprintf("Iteration %d/%d, Acceptance rate: %.3f",
                   iter, n_iter, overall_accept))
     }
   }
 
-  cat(sprintf("MCMC complete. Final acceptance rate: %.3f\n",
+  cat(sprintf("MCMC complete. Final acceptance rate: %.3f",
               sum(accept_count) / (n_iter * p)))
 
   return(list(
@@ -228,9 +216,9 @@ run_multiple_chains <- function(X, time, status,
 
   chains <- vector("list", n_chains)
 
-  cat(paste0("Running ", n_chains, " chains...\n"))
+  cat(paste0("Running ", n_chains, " chains..."))
   for (i in 1:n_chains) {
-    cat(sprintf("Chain %d/%d\n", i, n_chains))
+    cat(sprintf("Chain %d/%d", i, n_chains))
     chains[[i]] <- adaptive_mcmc(X, time, status,
                                   n_iter = n_iter,
                                   burnin = burnin,
@@ -239,10 +227,6 @@ run_multiple_chains <- function(X, time, status,
 
   return(chains)
 }
-
-# =============================================================================
-# Convergence Diagnostics
-# =============================================================================
 
 # Gelman-Rubin R-hat statistic
 gelman_rubin <- function(chains) {
@@ -296,10 +280,6 @@ effective_sample_size <- function(chains) {
   return(ess)
 }
 
-# =============================================================================
-# Posterior Summary
-# =============================================================================
-
 summarize_posterior <- function(samples, ci_width = 0.95) {
   summary_df <- data.frame(
     feature = colnames(samples),
@@ -327,10 +307,6 @@ summarize_posterior <- function(samples, ci_width = 0.95) {
 
   return(summary_df)
 }
-
-# =============================================================================
-# Visualization
-# =============================================================================
 
 # Trace plot for a single parameter
 plot_trace <- function(chains, feature_idx, save_path = "../figures/cox_trace_plots.png") {
@@ -362,7 +338,7 @@ plot_trace <- function(chains, feature_idx, save_path = "../figures/cox_trace_pl
 }
 
 # Forest plot of hazard ratios
-plot_forest <- function(summary_df, top_n = 20, save_path = "../figures/cox_forest_plot.png") {
+plot_forest <- function(summary_df, top_n = 20, save_path = "/Users/chenyanzhen/Documents/DS4420_final_project-2/figures/cox_forest_plot.png") {
   # Sort by absolute mean beta
   df <- summary_df %>%
     arrange(desc(abs(mean))) %>%
@@ -386,14 +362,10 @@ plot_forest <- function(summary_df, top_n = 20, save_path = "../figures/cox_fore
     )
 
   ggsave(save_path, p, width = 8, height = max(6, top_n * 0.25), dpi = 150)
-  cat(paste0("Forest plot saved to: ", save_path, "\n"))
+  cat(paste0("Forest plot saved to: ", save_path))
 }
 
-# =============================================================================
-# Main Analysis Function
-# =============================================================================
-
-run_analysis <- function(csv_path = "../data/brca_multimodal.csv",
+run_analysis <- function(csv_path = "/Users/chenyanzhen/Documents/DS4420_final_project-2/data/brca_multimodal.csv",
                          n_features = 100,
                          n_iter = 10000,
                          burnin = 1000,
@@ -402,15 +374,13 @@ run_analysis <- function(csv_path = "../data/brca_multimodal.csv",
   dir.create("../results", showWarnings = FALSE)
   dir.create("../figures", showWarnings = FALSE)
   
-  cat("=====================================\n")
-  cat("Bayesian Cox Proportional Hazards Model\n")
-  cat("Manual MCMC Implementation\n")
-  cat("=====================================\n\n")
+  cat("Bayesian Cox Proportional Hazards Model")
+  cat("Manual MCMC Implementation")
 
   # Load data
-  cat("Loading data...\n")
+  cat("Loading data...")
   data <- load_survival_data(csv_path, n_features)
-  cat(sprintf("n = %d samples, p = %d features\n\n", data$n, data$p))
+  cat(sprintf("n = %d samples, p = %d features", data$n, data$p))
 
   # Run multiple chains
   chains <- run_multiple_chains(data$X, data$time, data$status,
@@ -419,9 +389,7 @@ run_analysis <- function(csv_path = "../data/brca_multimodal.csv",
                                 burnin = burnin)
 
   # Convergence diagnostics
-  cat("\n=====================================\n")
-  cat("Convergence Diagnostics\n")
-  cat("=====================================\n")
+  cat("Convergence Diagnostics")
 
   rhat <- gelman_rubin(chains)
   ess <- effective_sample_size(chains)
@@ -433,17 +401,15 @@ run_analysis <- function(csv_path = "../data/brca_multimodal.csv",
   )
 
   converged <- sum(rhat < 1.1 & ess > 100)
-  cat(sprintf("Parameters with R-hat < 1.1 and ESS > 100: %d/%d\n", converged, length(rhat)))
-  cat(sprintf("Mean R-hat: %.3f (target < 1.1)\n", mean(rhat)))
-  cat(sprintf("Mean ESS: %.0f\n", mean(ess)))
+  cat(sprintf("Parameters with R-hat < 1.1 and ESS > 100: %d/%d", converged, length(rhat)))
+  cat(sprintf("Mean R-hat: %.3f (target < 1.1)", mean(rhat)))
+  cat(sprintf("Mean ESS: %.0f", mean(ess)))
 
   # Combine chains for final analysis
   combined_samples <- do.call(rbind, lapply(chains, function(c) c$samples))
 
   # Posterior summary
-  cat("\n=====================================\n")
-  cat("Posterior Summary\n")
-  cat("=====================================\n")
+  cat("Posterior Summary")
 
   summary_df <- summarize_posterior(combined_samples)
 
@@ -451,14 +417,12 @@ run_analysis <- function(csv_path = "../data/brca_multimodal.csv",
     filter(significant) %>%
     arrange(desc(abs(mean)))
 
-  cat(sprintf("\nSignificant biomarkers (95%% CI excludes 0): %d\n",
+  cat(sprintf("Significant biomarkers (95%% CI excludes 0): %d",
               nrow(significant_biomarkers)))
   print(head(significant_biomarkers, 10))
 
   # Visualizations
-  cat("\n=====================================\n")
-  cat("Generating Visualizations\n")
-  cat("=====================================\n")
+  cat("Generating Visualizations")
 
   # Trace plot for top feature
   top_feature_idx <- which(colnames(chains[[1]]$samples) ==
@@ -482,12 +446,10 @@ run_analysis <- function(csv_path = "../data/brca_multimodal.csv",
   conv_df %>%
     write.csv(conv_path, row.names = FALSE)
 
-  cat("\n=====================================\n")
-  cat("Results Saved\n")
-  cat("=====================================\n")
-  cat(paste0("- Coefficient summary: ", results_path, "\n"))
-  cat(paste0("- Significant biomarkers: ", biomarkers_path, "\n"))
-  cat(paste0("- Convergence diagnostics: ", conv_path, "\n"))
+  cat("Results Saved")
+  cat(paste0("Coefficient summary: ", results_path))
+  cat(paste0("Significant biomarkers: ", biomarkers_path))
+  cat(paste0("Convergence diagnostics: ", conv_path))
 
   return(list(
     summary = summary_df,
@@ -497,9 +459,6 @@ run_analysis <- function(csv_path = "../data/brca_multimodal.csv",
   ))
 }
 
-# =============================================================================
-# Main Execution
-# =============================================================================
 
 # Run the analysis
 results <- run_analysis(csv_path = "/Users/chenyanzhen/Documents/DS4420_final_project-2/data/brca_multimodal.csv",
