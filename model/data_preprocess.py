@@ -2,7 +2,6 @@ import os
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from lifelines import CoxPHFitter
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
@@ -15,185 +14,182 @@ def load_raw_data():
     print(f"Loaded data: {df.shape}")
     return df
 
-# 2. LASSO feature selection
-def lasso_cox_feature_selection(X, y_time, y_event, feature_names, top_k=100):
-    df = pd.DataFrame(X, columns=feature_names)
-    df["OS.time"] = y_time
-    df["OS"] = y_event
 
-    cph = CoxPHFitter(penalizer=0.1, l1_ratio=1.0)
-    cph.fit(df, duration_col="OS.time", event_col="OS")
+# 2. Preprocess
+def preprocess_all(df, var_percentile=50, test_size=0.2, seed=42):
+    print("\n" + "=" * 50)
+    print("Preprocessing (y-agnostic operations only)")
+    print("=" * 50)
 
-    coefs = cph.params_.values
-    idx = np.argsort(np.abs(coefs))[-top_k:][::-1]
-
-    selected_features = [feature_names[i] for i in idx]
-
-    print(f"LASSO selected: {len(selected_features)} features")
-
-    return idx, selected_features
-
-# 3. Unified preprocessing
-def preprocess_all(df, n_features=500, test_size=0.2, seed=42):
-    print("\nUnified preprocessing")
-
-    # Drop useless columns
-    drop_cols = ["sample", "sampleID_x", "sampleID_y", "sampleID"]
+    # 2a. Drop useless columns
+    drop_cols = [
+        "sample", "sampleID_x", "sampleID_y", "sampleID",
+        "ER.Status", "PR.Status", "HER2.Final.Status"  
+    ]
     df = df.drop(columns=[c for c in drop_cols if c in df.columns])
 
-    # Ensure survival columns are numeric and drop invalid rows
+    # 2b. Ensure survival columns are valid
     df["OS"] = pd.to_numeric(df["OS"], errors="coerce")
     df["OS.time"] = pd.to_numeric(df["OS.time"], errors="coerce")
-    df = df.dropna(subset=["OS", "OS.time"]).copy()
+    df = df.dropna(subset=["OS", "OS.time"])
+    df = df[df["OS.time"] > 0].copy()
 
-    # Extract survival
     y_event = df["OS"].values.astype(float)
-    y_time = df["OS.time"].values
+    y_time = df["OS.time"].values.astype(float)
 
-    # Feature matrix
+    print(f"Valid samples: {len(df)}")
+    print(f"Events (OS=1): {int(y_event.sum())}  "
+          f"Censored (OS=0): {int((y_event == 0).sum())}  "
+          f"Event rate: {y_event.mean():.1%}")
+
+    # 2c. Build feature matrix (all numeric columns)
     X_df = df.drop(columns=["OS", "OS.time"])
     X_df = X_df.apply(pd.to_numeric, errors="coerce")
     X_df = X_df.select_dtypes(include=[np.number])
-    # Two-stage imputation: mean fill, then 0 for all-NaN columns
-    X_df = X_df.fillna(X_df.mean())
-    X_df = X_df.fillna(0.0)
 
-    X = X_df.values.astype(float)
+    # drop columns with all NaN columns
+    X_df = X_df.dropna(axis=1, how="all")
+    const_cols = X_df.columns[X_df.nunique() <= 1]
+    if len(const_cols) > 0:
+        print(f"Dropped {len(const_cols)} constant columns")
+        X_df = X_df.drop(columns=const_cols)
+
     feature_names = X_df.columns.tolist()
 
-    # 3. Train/Test Split
-    X_train, X_test, y_event_train, y_event_test, y_time_train, y_time_test = train_test_split(
-        X,
-        y_event,
-        y_time,
+    # record clinical features
+    clinical_cols = ["age_at_initial_pathologic_diagnosis"]
+    clinical_cols = [c for c in clinical_cols if c in feature_names]
+
+    print(f"Total features: {len(feature_names)}")
+    print(f"Clinical features: {clinical_cols}")
+
+    X = X_df.values.astype(float)
+
+    # 2d. Train / Test split 
+    X_tr, X_te, y_ev_tr, y_ev_te, y_ti_tr, y_ti_te = train_test_split(
+        X, y_event, y_time,
         test_size=test_size,
         random_state=seed,
         stratify=y_event
     )
 
-    print(f"Train size: {X_train.shape}")
-    print(f"Test size: {X_test.shape}")
+    print(f"\nTrain: {X_tr.shape[0]}  Test: {X_te.shape[0]}")
+    print(f"Train events: {int(y_ev_tr.sum())}  "
+          f"Test events: {int(y_ev_te.sum())}")
 
-    # 4. Feature selection
+    # 2e. Imputation — use train set means to fill NaNs
+    col_means = np.nanmean(X_tr, axis=0)
+    col_means = np.where(np.isnan(col_means), 0.0, col_means)
 
-    # clinical features
-    clinical_cols = [
-        "ER.Status",
-        "PR.Status",
-        "HER2.Final.Status",
-        "age_at_initial_pathologic_diagnosis"
-    ]
-    clinical_cols = [c for c in clinical_cols if c in feature_names]
+    for j in range(X_tr.shape[1]):
+        mask_tr = np.isnan(X_tr[:, j])
+        mask_te = np.isnan(X_te[:, j])
+        X_tr[mask_tr, j] = col_means[j]
+        X_te[mask_te, j] = col_means[j]
 
-    # Step 1: variance filtering
-    var = np.var(X_train, axis=0)
-    idx_var = np.argsort(var)[-1000:][::-1]
+    # 2f. Variance filter
+    variances = np.var(X_tr, axis=0)
 
-    X_train_var = X_train[:, idx_var]
-    X_test_var = X_test[:, idx_var]
-    feature_names_var = [feature_names[i] for i in idx_var]
+    # keep clinical features
+    clinical_mask = np.array([f in clinical_cols for f in feature_names])
+    gene_mask = ~clinical_mask
 
-    # Step 2: LASSO Cox
-    gene_features = [f for f in feature_names_var if f not in clinical_cols]
-    gene_idx = [feature_names_var.index(f) for f in gene_features]
+    # variance filter for gene/protein features
+    gene_vars = variances[gene_mask]
+    var_threshold = np.percentile(gene_vars, 100 - var_percentile)
+    gene_pass = gene_vars >= var_threshold
 
-    X_train_gene = X_train_var[:, gene_idx]
+    # combine clinical features and gene/protein features
+    keep_mask = clinical_mask.copy()
+    keep_mask[gene_mask] = gene_pass
 
-    idx_lasso, selected_gene_features = lasso_cox_feature_selection(
-        X_train_gene,
-        y_time_train,
-        y_event_train,
-        gene_features,
-        top_k=n_features - len(clinical_cols)
-    )
+    X_tr = X_tr[:, keep_mask]
+    X_te = X_te[:, keep_mask]
+    feature_names = [f for f, k in zip(feature_names, keep_mask) if k]
+    clinical_idx = [i for i, f in enumerate(feature_names) if f in clinical_cols]
 
-    # Combine clinical features
-    selected_features = selected_gene_features + clinical_cols
+    print(f"\nAfter variance filter (top {var_percentile}%): "
+          f"{len(feature_names)} features kept")
 
-    # Find final index
-    final_idx = [feature_names.index(f) for f in selected_features]
+    # 2g. Standardization — use train set means and stds
+    mean = X_tr.mean(axis=0)
+    std = X_tr.std(axis=0) + 1e-8
 
-    X_train = X_train[:, final_idx]
-    X_test = X_test[:, final_idx]
-    feature_names = selected_features
+    X_tr = (X_tr - mean) / std
+    X_te = (X_te - mean) / std
 
-    print(f"Final selected features: {len(feature_names)}")
-    print(f"Clinical features kept: {len(clinical_cols)}")
-
-    # 5. Normalization
-    mean = X_train.mean(axis=0)
-    std = X_train.std(axis=0) + 1e-8
-
-    X_train = (X_train - mean) / std
-    X_test = (X_test - mean) / std
-
-    # 6. MLP label
-    threshold = np.median(y_time_train)
-
-    y_mlp_train = (y_time_train > threshold).astype(int)
-    y_mlp_test = (y_time_test > threshold).astype(int)
-
-    print(f"Median survival (train): {threshold:.1f}")
-    print(f"MLP label balance: {np.mean(y_mlp_train):.2f}")
-
-    return {
+    # 2h. Package and return processed data
+    data = {
         "features": feature_names,
+        "clinical_idx": clinical_idx,   
 
-        # Cox
-        "X_train": X_train,
-        "X_test": X_test,
-        "y_event_train": y_event_train,
-        "y_event_test": y_event_test,
-        "y_time_train": y_time_train,
-        "y_time_test": y_time_test,
-
-        # MLP
-        "y_mlp_train": y_mlp_train,
-        "y_mlp_test": y_mlp_test
+        "X_train": X_tr,
+        "X_test": X_te,
+        "y_event_train": y_ev_tr,
+        "y_event_test": y_ev_te,
+        "y_time_train": y_ti_tr,
+        "y_time_test": y_ti_te,
+        "norm_mean": mean,
+        "norm_std": std,
     }
 
+    print(f"\n--- Preprocessing done ---")
+    print(f"Output shape: X_train {X_tr.shape}, X_test {X_te.shape}")
 
-# 4. Save datasets
+    return data
+
+
+# 3. Save datasets
 def save_data(data):
     print("\nSaving processed data...")
+    data_dir = os.path.join(PROJECT_ROOT, "data")
+    os.makedirs(data_dir, exist_ok=True)
 
-    # Cox
-    cox_train = pd.DataFrame(data["X_train"], columns=data["features"])
-    cox_train["OS"] = data["y_event_train"]
-    cox_train["OS.time"] = data["y_time_train"]
+    # Train set
+    train_df = pd.DataFrame(data["X_train"], columns=data["features"])
+    train_df["OS"] = data["y_event_train"]
+    train_df["OS.time"] = data["y_time_train"]
+    train_df.to_csv(os.path.join(data_dir, "train.csv"), index=False)
 
-    cox_test = pd.DataFrame(data["X_test"], columns=data["features"])
-    cox_test["OS"] = data["y_event_test"]
-    cox_test["OS.time"] = data["y_time_test"]
+    # Test set
+    test_df = pd.DataFrame(data["X_test"], columns=data["features"])
+    test_df["OS"] = data["y_event_test"]
+    test_df["OS.time"] = data["y_time_test"]
+    test_df.to_csv(os.path.join(data_dir, "test.csv"), index=False)
 
-    cox_train.to_csv(os.path.join(PROJECT_ROOT, "data", "cox_train.csv"), index=False)
-    cox_test.to_csv(os.path.join(PROJECT_ROOT, "data", "cox_test.csv"), index=False)
+    # Feature list + metadata
+    feat_df = pd.DataFrame({
+        "feature": data["features"],
+        "is_clinical": [i in data["clinical_idx"]
+                        for i in range(len(data["features"]))]
+    })
+    feat_df.to_csv(os.path.join(data_dir, "features.csv"), index=False)
 
-    # MLP
-    mlp_train = pd.DataFrame(data["X_train"], columns=data["features"])
-    mlp_train["y"] = data["y_mlp_train"]
+    # Normalization params (for inference)
+    norm_df = pd.DataFrame({
+        "feature": data["features"],
+        "mean": data["norm_mean"],
+        "std": data["norm_std"]
+    })
+    norm_df.to_csv(os.path.join(data_dir, "norm_params.csv"), index=False)
 
-    mlp_test = pd.DataFrame(data["X_test"], columns=data["features"])
-    mlp_test["y"] = data["y_mlp_test"]
-
-    mlp_train.to_csv(os.path.join(PROJECT_ROOT, "data", "mlp_train.csv"), index=False)
-    mlp_test.to_csv(os.path.join(PROJECT_ROOT, "data", "mlp_test.csv"), index=False)
-
-    # Feature list
-    with open(os.path.join(PROJECT_ROOT, "data", "features.txt"), "w") as f:
-        for name in data["features"]:
-            f.write(name + "\n")
-
-    print("Saved all datasets")
+    print(f"Saved: train.csv, test.csv, features.csv, norm_params.csv")
 
 
-# 5. Main
+# 4. Main
 def main():
     df = load_raw_data()
-    data = preprocess_all(df)
-    save_data(data)
-    print("\nDone.")
 
+    data = preprocess_all(
+        df,
+        var_percentile=50,   
+        test_size=0.2,
+        seed=42
+    )
+
+    save_data(data)
+
+    print("Done!")
 
 if __name__ == "__main__":
     main()

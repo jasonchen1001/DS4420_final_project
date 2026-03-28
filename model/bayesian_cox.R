@@ -1,614 +1,415 @@
+# Cox Survival Analysis Pipeline (Streamlined)
+# Flow: KM -> Univariate -> P-filter -> Penalized Cox -> Bayesian Cox -> Validation -> Stability
+
 library(dplyr)
 library(ggplot2)
 library(survival)
+library(survminer)
+library(glmnet)
+library(plotmo)
 
-# Project paths
 PROJECT_ROOT <- "/Users/chenyanzhen/Documents/DS4420_final_project-2"
-DATA_DIR <- file.path(PROJECT_ROOT, "data")
-RESULTS_DIR <- file.path(PROJECT_ROOT, "results")
-FIGURES_DIR <- file.path(PROJECT_ROOT, "figures")
-
+DATA_DIR     <- file.path(PROJECT_ROOT, "data")
+RESULTS_DIR  <- file.path(PROJECT_ROOT, "results", "cox")
+FIGURES_DIR  <- file.path(PROJECT_ROOT, "figures", "cox")
 dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
 dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
 
-# Helper: identify omics blocks
-identify_feature_blocks <- function(feature_names) {
-  clinical_cols <- c(
-    "ER.Status",
-    "PR.Status",
-    "HER2.Final.Status",
-    "age_at_initial_pathologic_diagnosis"
-  )
 
-  clinical <- intersect(feature_names, clinical_cols)
-
-  protein <- feature_names[
-    grepl("^[A-Z0-9]+$", feature_names) &
-      !(feature_names %in% clinical)
-  ]
-
-  gene <- setdiff(feature_names, c(protein, clinical))
-
-  list(
-    gene = gene,
-    protein = protein,
-    clinical = clinical
-  )
+# ---- Load data ----
+load_data <- function() {
+  train <- read.csv(file.path(DATA_DIR, "train.csv"), check.names = FALSE)
+  test  <- read.csv(file.path(DATA_DIR, "test.csv"),  check.names = FALSE)
+  feat  <- read.csv(file.path(DATA_DIR, "features.csv"))
+  
+  features       <- feat$feature
+  clinical_feats <- feat$feature[feat$is_clinical == TRUE]
+  
+  X_train <- as.matrix(train[, features]); storage.mode(X_train) <- "double"
+  X_test  <- as.matrix(test[, features]);  storage.mode(X_test)  <- "double"
+  X_train[!is.finite(X_train)] <- 0
+  X_test[!is.finite(X_test)]   <- 0
+  
+  train$time_years <- train$OS.time / 365.25
+  test$time_years  <- test$OS.time / 365.25
+  
+  cat(sprintf("Train: %d samples, %d features, %d events\n",
+              nrow(X_train), ncol(X_train), sum(train$OS)))
+  cat(sprintf("Test:  %d samples, %d features, %d events\n",
+              nrow(X_test), ncol(X_test), sum(test$OS)))
+  
+  list(train=train, test=test, X_train=X_train, X_test=X_test,
+       features=features, clinical_feats=clinical_feats)
 }
 
-# Load preprocessed survival data from Python pipeline
-load_survival_data <- function(
-    train_csv = file.path(DATA_DIR, "cox_train.csv"),
-    test_csv = file.path(DATA_DIR, "cox_test.csv")) {
 
-  train_df <- read.csv(train_csv, check.names = FALSE)
-  test_df  <- read.csv(test_csv, check.names = FALSE)
+# ---- Step 1: Kaplan-Meier ----
+run_km <- function(data) {
+  cat("\n[Step 1] Kaplan-Meier\n")
+  train <- data$train
+  assign("train", train, envir = .GlobalEnv)
+  on.exit(rm("train", envir = .GlobalEnv), add = TRUE)
+  
+  sfit <- survfit(Surv(time_years, OS) ~ 1, data = train)
+  cat("Survival at 1, 3, 5 years:\n")
+  print(summary(sfit, times = c(1, 3, 5)))
+  
+  ggsurv <- ggsurvplot(sfit, data=train, conf.int=TRUE, risk.table=TRUE,
+                       xlab="Time (years)", legend="none", surv.median.line="hv")
+  pdf(file.path(FIGURES_DIR, "km_overall.pdf"), width=8, height=6)
+  print(ggsurv)
+  dev.off()
+  cat("Saved: km_overall.pdf\n")
+}
 
-  # survival variables
-  train_time <- train_df$OS.time
-  train_status <- train_df$OS
 
-  test_time <- test_df$OS.time
-  test_status <- test_df$OS
-
-  # feature matrices
-  X_train <- train_df %>%
-    select(-OS, -OS.time) %>%
-    as.matrix()
-
-  X_test <- test_df %>%
-    select(-OS, -OS.time) %>%
-    as.matrix()
-
-  storage.mode(X_train) <- "double"
-  storage.mode(X_test) <- "double"
-
-  # Safety cleanup: guard against NA/Inf from mixed-type CSV columns
-  bad_train <- !is.finite(X_train)
-  bad_test <- !is.finite(X_test)
-  n_bad <- sum(bad_train) + sum(bad_test)
-  if (n_bad > 0) {
-    X_train[bad_train] <- 0
-    X_test[bad_test] <- 0
-    cat(sprintf("Warning: replaced %d non-finite feature values with 0\n", n_bad))
+# ---- Step 2: Univariate Cox ----
+run_univariate <- function(data) {
+  cat("\n[Step 2] Univariate Cox screening\n")
+  train <- data$train
+  
+  # Age: PH assumption check
+  fit_age <- coxph(Surv(time_years, OS) ~ age_at_initial_pathologic_diagnosis, data=train)
+  cat("Age Cox:\n"); print(summary(fit_age))
+  zph <- cox.zph(fit_age, transform="log")
+  cat("PH check:\n"); print(zph)
+  
+  # Screen all features
+  results <- list()
+  for (feat in data$features) {
+    tryCatch({
+      tmp <- data.frame(T=train$time_years, E=train$OS, x=data$X_train[,feat])
+      s <- summary(coxph(Surv(T, E) ~ x, data=tmp))
+      results[[feat]] <- data.frame(feature=feat, coef=s$coefficients[,"coef"],
+                                    HR=s$coefficients[,"exp(coef)"], p_value=s$coefficients[,"Pr(>|z|)"])
+    }, error=function(e) NULL)
   }
-
-  feature_names <- colnames(X_train)
-  blocks <- identify_feature_blocks(feature_names)
-
-  cat("Loaded processed survival data\n")
-  cat(sprintf("Train: n = %d, p = %d\n", nrow(X_train), ncol(X_train)))
-  cat(sprintf("Test : n = %d, p = %d\n", nrow(X_test), ncol(X_test)))
-  cat(sprintf("Gene: %d | Protein: %d | Clinical: %d\n",
-              length(blocks$gene), length(blocks$protein), length(blocks$clinical)))
-
-  list(
-    X_train = X_train,
-    time_train = train_time,
-    status_train = train_status,
-    X_test = X_test,
-    time_test = test_time,
-    status_test = test_status,
-    feature_names = feature_names,
-    blocks = blocks,
-    n_train = nrow(X_train),
-    n_test = nrow(X_test),
-    p = ncol(X_train)
-  )
+  uni_df <- bind_rows(results) %>% arrange(p_value)
+  cat(sprintf("Tested: %d | p<0.05: %d | p<0.1: %d\n",
+              nrow(uni_df), sum(uni_df$p_value<0.05), sum(uni_df$p_value<0.1)))
+  uni_df
 }
 
-# Cox partial log-likelihood (Breslow for ties)
+
+# ---- Step 3: P-value filter ----
+pvalue_filter <- function(uni_df, data, alpha=0.1) {
+  cat(sprintf("\n[Step 3] P-value filter (alpha=%g)\n", alpha))
+  selected <- union(uni_df$feature[uni_df$p_value < alpha], data$clinical_feats)
+  cat(sprintf("Selected: %d features\n", length(selected)))
+  selected
+}
+
+
+# ---- Step 4: Penalized Cox ----
+run_penalized_cox <- function(data, candidate_feats) {
+  cat("\n[Step 4] Penalized Cox models\n")
+  x <- data$X_train[, candidate_feats]
+  y <- Surv(data$train$time_years, data$train$OS)
+  pf <- rep(1, length(candidate_feats))
+  pf[candidate_feats %in% data$clinical_feats] <- 0
+  
+  # Lasso
+  set.seed(123)
+  cvfit_lasso <- cv.glmnet(x, y, family="cox", alpha=1, nfolds=5, penalty.factor=pf)
+  lambda_opt <- cvfit_lasso$lambda.1se
+  coefs <- as.vector(coef(cvfit_lasso, s="lambda.1se"))
+  names(coefs) <- candidate_feats
+  selected <- names(coefs[abs(coefs) > 1e-6])
+  cat(sprintf("Lasso (lambda.1se=%.4f): %d features\n", lambda_opt, length(selected)))
+  
+  if (length(selected) < 2) {
+    cat("lambda.1se too strict, using lambda.min\n")
+    lambda_opt <- cvfit_lasso$lambda.min
+    coefs <- as.vector(coef(cvfit_lasso, s="lambda.min"))
+    names(coefs) <- candidate_feats
+    selected <- names(coefs[abs(coefs) > 1e-6])
+    cat(sprintf("Lasso (lambda.min=%.4f): %d features\n", lambda_opt, length(selected)))
+  }
+  
+  # Elastic Net
+  alpha_seq <- seq(0.1, 1, length=10)
+  fitEN <- list()
+  set.seed(123)
+  for (i in seq_along(alpha_seq))
+    fitEN[[i]] <- cv.glmnet(x, y, family="cox", alpha=alpha_seq[i], nfolds=5, penalty.factor=pf)
+  best_idx <- which.min(sapply(fitEN, function(xx) xx$cvm[xx$lambda == xx$lambda.min]))
+  coefs_en <- as.vector(coef(fitEN[[best_idx]], s="lambda.1se"))
+  names(coefs_en) <- candidate_feats
+  selected_en <- names(coefs_en[abs(coefs_en) > 1e-6])
+  cat(sprintf("Elastic Net (alpha=%.1f): %d features\n", alpha_seq[best_idx], length(selected_en)))
+  
+  # Adaptive Lasso
+  set.seed(123)
+  fit_ridge <- cv.glmnet(x, y, family="cox", alpha=0, nfolds=5)
+  weights <- abs(1 / as.vector(coef(fit_ridge, s="lambda.min")))
+  weights[candidate_feats %in% data$clinical_feats] <- 0
+  cvfit_al <- cv.glmnet(x, y, family="cox", nfolds=5, penalty.factor=weights)
+  coefs_al <- as.vector(coef(cvfit_al, s="lambda.1se"))
+  names(coefs_al) <- candidate_feats
+  selected_al <- names(coefs_al[abs(coefs_al) > 1e-6])
+  cat(sprintf("Adaptive Lasso: %d features\n", length(selected_al)))
+  
+  overlap <- Reduce(intersect, list(selected, selected_en, selected_al))
+  cat(sprintf("Intersection (all 3): %s\n", paste(overlap, collapse=", ")))
+  
+  # Lasso coefficient path plot
+  mod <- cvfit_lasso$glmnet.fit
+  pdf(file.path(FIGURES_DIR, "lasso_path.pdf"), width=8, height=6)
+  plot_glmnet(mod, label=TRUE, s=lambda_opt,
+              xlab=expression(log~~lambda), ylab=expression(beta))
+  title("Lasso Cox\n\n")
+  dev.off()
+  cat("Saved: lasso_path.pdf\n")
+  
+  list(lasso=list(cvfit=cvfit_lasso, selected=selected, coefs=coefs),
+       en_selected=selected_en, alasso_selected=selected_al,
+       candidate_feats=candidate_feats, pf=pf, lambda_opt=lambda_opt)
+}
+
+
+# ---- Step 5: Bayesian Cox (Laplace prior, MCMC) ----
 log_partial_likelihood <- function(beta, X, time, status) {
   eta <- as.vector(X %*% beta)
-  
-  event_times <- sort(unique(time[status == 1]))
-  log_lik <- 0
-  
-  for (t in event_times) {
-    at_risk <- which(time >= t)
-    events <- which(time == t & status == 1)
-    
-    if (length(events) == 0) next
-    
-    eta_risk <- eta[at_risk]
-    
-    max_eta <- max(eta_risk)
-    risk_sum <- sum(exp(eta_risk - max_eta))
-    
-    if (!is.finite(risk_sum) || risk_sum <= 0) {
-      return(-Inf)
-    }
-    
-    log_risk <- log(risk_sum) + max_eta
-    
-    log_lik <- log_lik + sum(eta[events]) - length(events) * log_risk
+  ll <- 0
+  for (t_k in sort(unique(time[status==1]))) {
+    at_risk <- which(time >= t_k)
+    events  <- which(time == t_k & status == 1)
+    if (length(events)==0) next
+    eta_r <- eta[at_risk]; mx <- max(eta_r)
+    lr <- log(sum(exp(eta_r - mx))) + mx
+    if (!is.finite(lr)) return(-Inf)
+    ll <- ll + sum(eta[events]) - length(events)*lr
   }
-  
-  log_lik
+  ll
 }
 
-# Block-specific prior
-log_prior_block <- function(beta, feature_names,
-                            sigma_gene = 1.0,
-                            sigma_protein = 1.0,
-                            sigma_clinical = 2.0) {
-
-  blocks <- identify_feature_blocks(feature_names)
-
+log_posterior <- function(beta, X, time, status, feat_names, clin_feats,
+                          lambda=1.0, sigma_clin=5.0) {
   lp <- 0
-
-  if (length(blocks$gene) > 0) {
-    idx <- match(blocks$gene, feature_names)
-    lp <- lp + sum(dnorm(beta[idx], mean = 0, sd = sigma_gene, log = TRUE))
+  for (j in seq_along(beta)) {
+    if (feat_names[j] %in% clin_feats)
+      lp <- lp + dnorm(beta[j], 0, sigma_clin, log=TRUE)
+    else
+      lp <- lp + log(lambda/2) - lambda*abs(beta[j])
   }
-
-  if (length(blocks$protein) > 0) {
-    idx <- match(blocks$protein, feature_names)
-    lp <- lp + sum(dnorm(beta[idx], mean = 0, sd = sigma_protein, log = TRUE))
-  }
-
-  if (length(blocks$clinical) > 0) {
-    idx <- match(blocks$clinical, feature_names)
-    lp <- lp + sum(dnorm(beta[idx], mean = 0, sd = sigma_clinical, log = TRUE))
-  }
-
-  lp
+  log_partial_likelihood(beta, X, time, status) + lp
 }
 
-log_posterior <- function(beta, X, time, status, feature_names,
-                          sigma_gene = 1.0,
-                          sigma_protein = 1.0,
-                          sigma_clinical = 2.0) {
-  log_partial_likelihood(beta, X, time, status) +
-    log_prior_block(beta, feature_names,
-                    sigma_gene = sigma_gene,
-                    sigma_protein = sigma_protein,
-                    sigma_clinical = sigma_clinical)
-}
-
-# Single MH step (coordinate-wise)
-mh_step <- function(beta, current_log_post,
-                    X, time, status, feature_names,
-                    idx, step_sizes,
-                    sigma_gene = 1.0,
-                    sigma_protein = 1.0,
-                    sigma_clinical = 1.0) {
+run_bayesian_cox <- function(data, selected_feats,
+                             n_iter=10000, burnin=5000, n_chains=3) {
+  cat(sprintf("\n[Step 5] Bayesian Cox MCMC (%d features, %d iter, %d chains)\n",
+              length(selected_feats), n_iter, n_chains))
   
-  beta_prop <- beta
-  beta_prop[idx] <- rnorm(1, mean = beta[idx], sd = step_sizes[idx])
+  X <- data$X_train[, match(selected_feats, data$features), drop=FALSE]
+  time <- data$train$time_years; status <- data$train$OS
+  p <- length(selected_feats)
+  chains <- vector("list", n_chains)
   
-  if (any(abs(beta_prop) > 20)) {
-    return(list(beta = beta, log_post = current_log_post, accepted = FALSE))
-  }
-  
-  prop_log_post <- log_posterior(
-    beta_prop, X, time, status, feature_names,
-    sigma_gene = sigma_gene,
-    sigma_protein = sigma_protein,
-    sigma_clinical = sigma_clinical
-  )
-  
-  if (!is.finite(prop_log_post)) {
-    return(list(beta = beta, log_post = current_log_post, accepted = FALSE))
-  }
-  
-  log_alpha <- min(0, prop_log_post - current_log_post)
-  
-  if (!is.finite(log_alpha)) {
-    return(list(beta = beta, log_post = current_log_post, accepted = FALSE))
-  }
-  
-  if (log(runif(1)) < log_alpha) {
-    list(beta = beta_prop, log_post = prop_log_post, accepted = TRUE)
-  } else {
-    list(beta = beta, log_post = current_log_post, accepted = FALSE)
-  }
-}
-
-# Adaptive MCMC
-adaptive_mcmc <- function(X, time, status, feature_names,
-                          n_iter = 5000,
-                          burnin = 1000,
-                          sigma_gene = 1.0,
-                          sigma_protein = 1.0,
-                          sigma_clinical = 2.0,
-                          init_step_size = 0.001,
-                          target_accept = 0.234,
-                          adapt_period = 1000,
-                          seed = 42) {
-
-  set.seed(seed)
-
-  p <- ncol(X)
-  beta <- rep(0, p)
-  step_sizes <- rep(init_step_size, p)
-
-  samples <- matrix(NA_real_, nrow = n_iter, ncol = p)
-  colnames(samples) <- feature_names
-
-  accept_count <- rep(0, p)
-
-  current_log_post <- log_posterior(
-    beta, X, time, status, feature_names,
-    sigma_gene = sigma_gene,
-    sigma_protein = sigma_protein,
-    sigma_clinical = sigma_clinical
-  )
-
-  cat("Running MCMC...\n")
-
-  for (iter in 1:n_iter) {
-    for (j in 1:p) {
-      step_result <- mh_step(
-        beta = beta,
-        current_log_post = current_log_post,
-        X = X,
-        time = time,
-        status = status,
-        feature_names = feature_names,
-        idx = j,
-        step_sizes = step_sizes,
-        sigma_gene = sigma_gene,
-        sigma_protein = sigma_protein,
-        sigma_clinical = sigma_clinical
-      )
-
-      beta <- step_result$beta
-      current_log_post <- step_result$log_post
-
-      if (step_result$accepted) {
-        accept_count[j] <- accept_count[j] + 1
-      }
-    }
-
-    samples[iter, ] <- beta
-
-    # adapt step sizes during early iterations
-    if (iter < adapt_period) {
+  for (ch in 1:n_chains) {
+    cat(sprintf("  Chain %d/%d\n", ch, n_chains))
+    set.seed(c(42,123,456)[ch])
+    beta <- rep(0, p); step <- rep(0.02, p); acc <- rep(0, p)
+    samples <- matrix(NA_real_, n_iter, p); colnames(samples) <- selected_feats
+    cur_lp <- log_posterior(beta, X, time, status, selected_feats, data$clinical_feats)
+    
+    for (iter in 1:n_iter) {
       for (j in 1:p) {
-        acc_rate <- accept_count[j] / iter
-        if (acc_rate < target_accept) {
-          step_sizes[j] <- step_sizes[j] * 0.9
-        } else if (acc_rate > target_accept) {
-          step_sizes[j] <- step_sizes[j] * 1.1
+        bp <- beta; bp[j] <- rnorm(1, beta[j], step[j])
+        if (abs(bp[j]) > 10) next
+        pp <- log_posterior(bp, X, time, status, selected_feats, data$clinical_feats)
+        if (is.finite(pp) && log(runif(1)) < (pp - cur_lp)) {
+          beta <- bp; cur_lp <- pp; acc[j] <- acc[j]+1
         }
       }
+      samples[iter,] <- beta
+      if (iter <= burnin && iter%%50==0)
+        for (j in 1:p) {
+          r <- acc[j]/iter
+          if (r < 0.39) step[j] <- step[j]*0.9
+          if (r > 0.49) step[j] <- step[j]*1.1
+        }
+      if (iter%%2000==0)
+        cat(sprintf("    iter %d/%d accept=%.3f\n", iter, n_iter, sum(acc)/(iter*p)))
     }
-
-    if (iter %% 100 == 0) {
-      overall_accept <- sum(accept_count) / (iter * p)
-      cat(sprintf("Iteration %d/%d | acceptance = %.6f\n",
-                  iter, n_iter, overall_accept))
-    }
+    cat(sprintf("    Done. Accept=%.3f\n", sum(acc)/(n_iter*p)))
+    chains[[ch]] <- samples[(burnin+1):n_iter, , drop=FALSE]
   }
-
-  final_accept <- sum(accept_count) / (n_iter * p)
-  cat(sprintf("MCMC complete. Final acceptance rate: %.6f\n", final_accept))
-
-  list(
-    samples = samples[(burnin + 1):n_iter, , drop = FALSE],
-    acceptance_rate = accept_count / n_iter,
-    final_acceptance = final_accept,
-    step_sizes = step_sizes,
-    burnin = burnin
+  
+  # Convergence
+  rhat <- sapply(1:p, function(j) {
+    cd <- sapply(chains, function(ch) ch[,j]); n <- nrow(cd)
+    W <- mean(apply(cd,2,var)); B <- var(colMeans(cd))*n
+    ifelse(W>0, sqrt(((n-1)*W+B)/(n*W)), NA)
+  })
+  cat(sprintf("Converged (R-hat<1.1): %d/%d\n", sum(rhat<1.1, na.rm=TRUE), p))
+  
+  # Posterior summary
+  combined <- do.call(rbind, chains)
+  post_df <- data.frame(
+    feature  = selected_feats,
+    post_mean = colMeans(combined),
+    post_sd  = apply(combined, 2, sd),
+    ci_025   = apply(combined, 2, quantile, 0.025),
+    ci_975   = apply(combined, 2, quantile, 0.975),
+    HR       = exp(colMeans(combined)),
+    HR_ci025 = exp(apply(combined, 2, quantile, 0.025)),
+    HR_ci975 = exp(apply(combined, 2, quantile, 0.975)),
+    prob_pos = colMeans(combined > 0),
+    signif   = (apply(combined, 2, quantile, 0.025)>0) | (apply(combined, 2, quantile, 0.975)<0)
   )
-}
-
-# Run multiple chains
-run_multiple_chains <- function(X, time, status, feature_names,
-                                n_chains = 3,
-                                n_iter = 5000,
-                                burnin = 1000,
-                                seeds = c(42, 123, 456),
-                                sigma_gene = 1.0,
-                                sigma_protein = 1.0,
-                                sigma_clinical = 2.0,
-                                init_step_size = 0.001) {
-
-  chains <- vector("list", n_chains)
-
-  cat(sprintf("Running %d chains...\n", n_chains))
-
-  if (length(seeds) < n_chains) {
-    set.seed(999)
-    seeds <- c(seeds, sample.int(1e6, n_chains - length(seeds)))
-  }
-
-  for (i in 1:n_chains) {
-    cat(sprintf("Chain %d/%d\n", i, n_chains))
-    chains[[i]] <- adaptive_mcmc(
-      X = X,
-      time = time,
-      status = status,
-      feature_names = feature_names,
-      n_iter = n_iter,
-      burnin = burnin,
-      seed = seeds[i],
-      sigma_gene = sigma_gene,
-      sigma_protein = sigma_protein,
-      sigma_clinical = sigma_clinical,
-      init_step_size = init_step_size
-    )
-
-    ar <- chains[[i]]$acceptance_rate
-    cat(sprintf(
-      "Chain %d parameter-level acceptance: min=%.6f | median=%.6f | max=%.6f\n",
-      i, min(ar), median(ar), max(ar)
-    ))
-  }
-
-  chains
-}
-
-# Gelman-Rubin R-hat
-gelman_rubin <- function(chains) {
-  n_chains <- length(chains)
-  p <- ncol(chains[[1]]$samples)
-  rhat <- numeric(p)
-
-  for (j in 1:p) {
-    chain_samples <- sapply(chains, function(ch) ch$samples[, j])
-    n_iter <- nrow(chain_samples)
-
-    W <- mean(apply(chain_samples, 2, var))
-    chain_means <- colMeans(chain_samples)
-    B <- var(chain_means) * n_iter
-    V <- ((n_iter - 1) * W + B) / n_iter
-
-    rhat[j] <- sqrt(V / W)
-  }
-
-  rhat
-}
-
-# Effective Sample Size
-effective_sample_size <- function(chains) {
-  p <- ncol(chains[[1]]$samples)
-  ess <- numeric(p)
-
-  for (j in 1:p) {
-    combined <- unlist(lapply(chains, function(ch) ch$samples[, j]))
-
-    acf_vals <- acf(combined,
-                    plot = FALSE,
-                    lag.max = min(500, length(combined) - 1))$acf
-
-    sum_acf <- sum(acf_vals)
-    if (!is.finite(sum_acf) || sum_acf < 1) sum_acf <- 1
-
-    ess[j] <- length(combined) / sum_acf
-  }
-
-  ess
-}
-
-# Posterior summary
-summarize_posterior <- function(samples) {
-  summary_df <- data.frame(
-    feature = colnames(samples),
-    mean = colMeans(samples),
-    median = apply(samples, 2, median),
-    sd = apply(samples, 2, sd),
-    q025 = apply(samples, 2, quantile, probs = 0.025),
-    q975 = apply(samples, 2, quantile, probs = 0.975)
-  )
-
-  summary_df$hr_mean <- exp(summary_df$mean)
-  summary_df$hr_q025 <- exp(summary_df$q025)
-  summary_df$hr_q975 <- exp(summary_df$q975)
-
-  summary_df$prob_positive <- colMeans(samples > 0)
-  summary_df$prob_negative <- colMeans(samples < 0)
-
-  summary_df$significant <- (summary_df$q025 > 0) | (summary_df$q975 < 0)
-
-  summary_df
-}
-
-# C-index on test set
-compute_test_cindex <- function(beta, X_test, time_test, status_test) {
-  risk_score <- as.vector(X_test %*% beta)
-
-  cobj <- survival::concordance(
-    survival::Surv(time_test, status_test) ~ risk_score,
-    reverse = TRUE
-  )
-
-  list(
-    c_index = unname(cobj$concordance),
-    se = unname(sqrt(cobj$var))
-  )
-}
-
-# Plots
-plot_trace <- function(chains, feature_idx,
-                       save_path = file.path(FIGURES_DIR, "cox_trace_plot.png")) {
-
-  feature_name <- colnames(chains[[1]]$samples)[feature_idx]
-
-  plot_df <- bind_rows(lapply(seq_along(chains), function(i) {
-    data.frame(
-      iteration = 1:nrow(chains[[i]]$samples),
-      value = chains[[i]]$samples[, feature_idx],
-      chain = factor(i)
-    )
-  }))
-
-  p <- ggplot(plot_df, aes(x = iteration, y = value, color = chain)) +
-    geom_line(alpha = 0.7, linewidth = 0.3) +
-    labs(
-      title = paste("Trace Plot:", feature_name),
-      x = "Iteration",
-      y = expression(beta),
-      color = "Chain"
-    ) +
-    theme_minimal()
-
-  ggsave(save_path, p, width = 10, height = 4, dpi = 150)
-  cat("Trace plot saved to:", save_path, "\n")
-}
-
-plot_forest <- function(summary_df, top_n = 20,
-                        save_path = file.path(FIGURES_DIR, "cox_forest_plot.png")) {
-
-  df <- summary_df %>%
-    arrange(desc(abs(mean))) %>%
-    slice_head(n = top_n) %>%
-    mutate(feature = reorder(feature, hr_mean))
-
-  p <- ggplot(df, aes(x = hr_mean, y = feature)) +
-    geom_point(size = 2) +
-    geom_errorbarh(aes(xmin = hr_q025, xmax = hr_q975), height = 0.2, linewidth = 0.5) +
-    geom_vline(xintercept = 1, linetype = "dashed", color = "red") +
+  cat(sprintf("Significant biomarkers (95%% CI excludes 0): %d\n", sum(post_df$signif)))
+  print(post_df[post_df$signif, c("feature","HR","HR_ci025","HR_ci975","prob_pos")])
+  
+  # Forest plot
+  fdf <- post_df %>% mutate(feature=reorder(feature, HR))
+  pp <- ggplot(fdf, aes(x=HR, y=feature)) +
+    geom_point(aes(color=signif), size=3) +
+    geom_errorbarh(aes(xmin=HR_ci025, xmax=HR_ci975), height=0.3) +
+    geom_vline(xintercept=1, linetype="dashed", color="red") +
+    scale_color_manual(values=c("TRUE"="#E24B4A","FALSE"="#888780")) +
     scale_x_log10() +
-    labs(
-      title = "Hazard Ratios with 95% Credible Intervals",
-      subtitle = paste("Top", top_n, "features by |posterior mean|"),
-      x = "Hazard Ratio (log scale)",
-      y = "Feature"
-    ) +
-    theme_minimal() +
-    theme(axis.text.y = element_text(size = 8))
-
-  ggsave(save_path, p, width = 8, height = max(6, top_n * 0.25), dpi = 150)
-  cat("Forest plot saved to:", save_path, "\n")
+    labs(title="Bayesian Cox: Hazard Ratios (95% CI)", x="HR (log scale)", y=NULL) +
+    theme_minimal() + theme(legend.position="none")
+  ggsave(file.path(FIGURES_DIR, "forest_plot.pdf"), pp, width=8, height=max(4, p*0.4))
+  cat("Saved: forest_plot.pdf\n")
+  
+  list(post_df=post_df, combined=combined, chains=chains)
 }
 
-# Full analysis
-run_analysis <- function(
-    train_csv = file.path(DATA_DIR, "cox_train.csv"),
-    test_csv = file.path(DATA_DIR, "cox_test.csv"),
-    n_iter = 5000,
-    burnin = 1000,
-    n_chains = 3,
-    sigma_gene = 1.0,
-    sigma_protein = 1.0,
-    sigma_clinical = 2.0,
-    init_step_size = 0.001) {
 
-  cat("Loading processed data...\n")
-  data <- load_survival_data(train_csv, test_csv)
-
-  cat("\nRunning Bayesian Cox model...\n")
-  chains <- run_multiple_chains(
-    X = data$X_train,
-    time = data$time_train,
-    status = data$status_train,
-    feature_names = data$feature_names,
-    n_chains = n_chains,
-    n_iter = n_iter,
-    burnin = burnin,
-    sigma_gene = sigma_gene,
-    sigma_protein = sigma_protein,
-    sigma_clinical = sigma_clinical,
-    init_step_size = init_step_size
-  )
-
-  cat("\nConvergence diagnostics...\n")
-  rhat <- gelman_rubin(chains)
-  ess <- effective_sample_size(chains)
-
-  conv_df <- data.frame(
-    feature = data$feature_names,
-    rhat = rhat,
-    ess = ess
-  )
-
-  converged <- sum(rhat < 1.1 & ess > 100)
-  cat(sprintf("Parameters with R-hat < 1.1 and ESS > 100: %d/%d\n",
-              converged, length(rhat)))
-  cat(sprintf("Mean R-hat: %.3f\n", mean(rhat)))
-  cat(sprintf("Mean ESS: %.1f\n", mean(ess)))
-
-  combined_samples <- do.call(rbind, lapply(chains, function(ch) ch$samples))
-  summary_df <- summarize_posterior(combined_samples)
-
-  significant_biomarkers <- summary_df %>%
-    filter(significant) %>%
-    arrange(desc(abs(mean)))
-
-  cat(sprintf("\nSignificant biomarkers (95%% CI excludes 0): %d\n",
-              nrow(significant_biomarkers)))
-
-  if (nrow(significant_biomarkers) > 0) {
-    print(head(significant_biomarkers, 10))
+# ---- Step 6: Bootstrap stability ----
+run_stability <- function(data, penalized, n_boot=100) {
+  cat(sprintf("\n[Step 6] Bootstrap stability (%d rounds)\n", n_boot))
+  cand <- penalized$candidate_feats; pf <- penalized$pf
+  lambda_use <- penalized$lambda_opt
+  counts <- setNames(rep(0, length(cand)), cand)
+  
+  set.seed(123)
+  for (i in 1:n_boot) {
+    idx <- sample(nrow(data$X_train), replace=TRUE)
+    tryCatch({
+      fit <- glmnet(data$X_train[idx, cand], Surv(data$train$time_years[idx], data$train$OS[idx]),
+                    family="cox", alpha=1, penalty.factor=pf)
+      co <- as.vector(coef(fit, s=lambda_use)); names(co) <- cand
+      counts[names(co[abs(co)>1e-6])] <- counts[names(co[abs(co)>1e-6])] + 1
+    }, error=function(e) NULL)
+    if (i%%25==0) cat(sprintf("  %d/%d\n", i, n_boot))
   }
+  
+  freq <- sort(counts/n_boot, decreasing=TRUE)
+  stable <- freq[freq>=0.5]
+  cat(sprintf("Stable features (>=50%%): %d\n", length(stable)))
+  print(stable)
+  
+  # Stability plot
+  top_n <- min(25, sum(freq>0))
+  pd <- data.frame(feature=factor(names(freq)[1:top_n], levels=rev(names(freq)[1:top_n])),
+                   freq=freq[1:top_n])
+  pp <- ggplot(pd, aes(x=freq, y=feature)) +
+    geom_col(aes(fill=freq>=0.5)) +
+    scale_fill_manual(values=c("TRUE"="#1D9E75","FALSE"="#B4B2A9"), guide="none") +
+    geom_vline(xintercept=0.5, linetype="dashed", color="red") +
+    labs(x="Selection frequency", y=NULL,
+         title=sprintf("Feature Stability (%d stable)", length(stable))) +
+    theme_minimal()
+  ggsave(file.path(FIGURES_DIR, "feature_stability.pdf"), pp,
+         width=9, height=max(5, top_n*0.3))
+  cat("Saved: feature_stability.pdf\n")
+  
+  list(stable=stable, freq=freq)
+}
 
-  # posterior mean beta for prediction
-  beta_mean <- colMeans(combined_samples)
 
-  test_perf <- compute_test_cindex(
-    beta = beta_mean,
-    X_test = data$X_test,
-    time_test = data$time_test,
-    status_test = data$status_test
-  )
+# ---- Validation (inside run_all_plots) ----
+run_validation_plots <- function(data, penalized, bayes, bayes_feats) {
+  # Lasso predictions
+  lambda_pred <- penalized$lambda_opt
+  pred_test <- predict(penalized$lasso$cvfit,
+                       newx=data$X_test[, penalized$candidate_feats], s=lambda_pred, type="link")
+  
+  # KM risk groups
+  rg <- ifelse(pred_test > median(pred_test), "High", "Low")
+  sfit_h <- survfit(Surv(data$test$time_years[rg=="High"], data$test$OS[rg=="High"]) ~ 1)
+  sfit_l <- survfit(Surv(data$test$time_years[rg=="Low"],  data$test$OS[rg=="Low"]) ~ 1)
+  .km_t <<- data$test$time_years; .km_s <<- data$test$OS; .km_g <<- rg
+  pval <- 1 - pchisq(survdiff(Surv(.km_t, .km_s) ~ .km_g)$chisq, 1)
+  rm(.km_t, .km_s, .km_g, envir=.GlobalEnv)
+  
+  pdf(file.path(FIGURES_DIR, "km_risk_groups.pdf"), width=8, height=6)
+  plot(sfit_h, col="#E24B4A", lwd=2, mark.time=TRUE,
+       xlab="Time (years)", ylab="Survival probability",
+       main=sprintf("Risk Stratification (Test, p=%.4f)", pval))
+  lines(sfit_l, col="#378ADD", lwd=2, mark.time=TRUE)
+  legend("bottomleft", c("High risk","Low risk"), col=c("#E24B4A","#378ADD"), lwd=2)
+  dev.off()
+  cat(sprintf("Log-rank p=%.4f | Saved: km_risk_groups.pdf\n", pval))
+  
+  # C-index
+  c_lasso <- glmnet::Cindex(pred=pred_test[,1], y=Surv(data$test$OS.time, data$test$OS))
+  beta_b <- bayes$post_df$post_mean
+  risk_b <- as.vector(data$X_test[, match(bayes_feats, data$features)] %*% beta_b)
+  c_bayes <- concordance(Surv(data$test$time_years, data$test$OS) ~ risk_b, reverse=TRUE)$concordance
+  cat(sprintf("Lasso C-index: %.4f | Bayesian C-index: %.4f\n", c_lasso, c_bayes))
+  
+  perf <- data.frame(metric=c("Lasso_Cindex","Bayesian_Cindex","LogRank_p"),
+                     value=c(c_lasso, c_bayes, pval))
+  write.csv(perf, file.path(RESULTS_DIR, "test_performance.csv"), row.names=FALSE)
+  perf
+}
 
-  cat(sprintf("\nTest C-index: %.3f (SE = %.3f)\n",
-              test_perf$c_index, test_perf$se))
 
-  # plots
-  if (nrow(significant_biomarkers) > 0) {
-    top_feature_name <- significant_biomarkers$feature[1]
-    top_feature_idx <- which(colnames(chains[[1]]$samples) == top_feature_name)
-    plot_trace(chains, top_feature_idx)
+# ---- Main: compute & save ----
+main <- function() {
+  data <- load_data()
+  run_km(data)
+  uni_df     <- run_univariate(data)
+  candidates <- pvalue_filter(uni_df, data, alpha=0.1)
+  penalized  <- run_penalized_cox(data, candidates)
+  
+  # Pick features for Bayesian
+  if (length(penalized$lasso$selected) >= 2) {
+    bfeats <- penalized$lasso$selected
+  } else if (length(penalized$en_selected) >= 2) {
+    bfeats <- penalized$en_selected
+  } else {
+    bfeats <- penalized$alasso_selected
   }
+  cat(sprintf("Bayesian Cox using %d features\n", length(bfeats)))
+  
+  bayes     <- run_bayesian_cox(data, bfeats, n_iter=10000, burnin=5000, n_chains=3)
+  stability <- run_stability(data, penalized, n_boot=100)
+  
+  # Save all results
+  results <- list(data=data, uni_df=uni_df, candidates=candidates,
+                  penalized=penalized, bayes_feats=bfeats,
+                  bayes=bayes, stability=stability)
+  saveRDS(results, file.path(RESULTS_DIR, "cox_results.rds"))
+  write.csv(bayes$post_df, file.path(RESULTS_DIR, "bayesian_cox_summary.csv"), row.names=FALSE)
+  cat(sprintf("\nResults saved to %s/\n", RESULTS_DIR))
+  
+  # Plots
+  run_all_plots(results)
+}
 
-  plot_forest(summary_df, top_n = 20)
-
-  # save outputs
-  write.csv(
-    summary_df %>% arrange(desc(abs(mean))),
-    file.path(RESULTS_DIR, "cox_coefficients.csv"),
-    row.names = FALSE
-  )
-
-  write.csv(
-    significant_biomarkers,
-    file.path(RESULTS_DIR, "biomarkers.csv"),
-    row.names = FALSE
-  )
-
-  write.csv(
-    conv_df,
-    file.path(RESULTS_DIR, "cox_convergence.csv"),
-    row.names = FALSE
-  )
-
-  write.csv(
-    data.frame(
-      test_c_index = test_perf$c_index,
-      test_c_index_se = test_perf$se
-    ),
-    file.path(RESULTS_DIR, "cox_test_performance.csv"),
-    row.names = FALSE
-  )
-
-  cat("\nResults saved to:\n")
-  cat(file.path(RESULTS_DIR, "cox_coefficients.csv"), "\n")
-  cat(file.path(RESULTS_DIR, "biomarkers.csv"), "\n")
-  cat(file.path(RESULTS_DIR, "cox_convergence.csv"), "\n")
-  cat(file.path(RESULTS_DIR, "cox_test_performance.csv"), "\n")
-
-  list(
-    summary = summary_df,
-    biomarkers = significant_biomarkers,
-    convergence = conv_df,
-    test_performance = test_perf,
-    chains = chains,
-    data = data
-  )
+# ---- Re-plot without re-training ----
+run_all_plots <- function(results=NULL) {
+  if (is.null(results)) {
+    cat("Loading saved results...\n")
+    results <- readRDS(file.path(RESULTS_DIR, "cox_results.rds"))
+  }
+  perf <- run_validation_plots(results$data, results$penalized,
+                               results$bayes, results$bayes_feats)
+  
+  cat("\n========== SUMMARY ==========\n")
+  cat(sprintf("Lasso: %d | EN: %d | AdaLasso: %d\n",
+              length(results$penalized$lasso$selected),
+              length(results$penalized$en_selected),
+              length(results$penalized$alasso_selected)))
+  cat(sprintf("Bayesian significant: %d | Bootstrap stable: %d\n",
+              sum(results$bayes$post_df$signif), length(results$stability$stable)))
+  print(perf)
 }
 
 # Run
-results <- run_analysis(
-  train_csv = file.path(DATA_DIR, "cox_train.csv"),
-  test_csv = file.path(DATA_DIR, "cox_test.csv"),
-  n_iter = 2000,
-  burnin = 500,
-  n_chains = 2,
-  sigma_gene = 1.0,
-  sigma_protein = 1.0,
-  sigma_clinical = 2.0,
-  init_step_size = 0.001
-)
+main()
+# To re-plot only: run_all_plots()
