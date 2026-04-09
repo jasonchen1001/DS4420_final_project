@@ -1,4 +1,4 @@
-# Cox Survival Analysis Pipeline (Streamlined)
+# Cox Survival Analysis Pipeline 
 # Flow: KM -> Univariate -> P-filter -> Penalized Cox -> Bayesian Cox -> Validation -> Stability
 
 library(dplyr)
@@ -16,10 +16,10 @@ dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
 dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
 
 
-# ---- Load data ----
+# Load data
 load_data <- function() {
-  train <- read.csv(file.path(DATA_DIR, "train.csv"), check.names = FALSE)
-  test  <- read.csv(file.path(DATA_DIR, "test.csv"),  check.names = FALSE)
+  train <- read.csv(file.path(DATA_DIR, "cox_train.csv"), check.names = FALSE)
+  test  <- read.csv(file.path(DATA_DIR, "cox_test.csv"),  check.names = FALSE)
   feat  <- read.csv(file.path(DATA_DIR, "features.csv"))
   
   features       <- feat$feature
@@ -43,7 +43,7 @@ load_data <- function() {
 }
 
 
-# ---- Step 1: Kaplan-Meier ----
+# Step 1: Kaplan-Meier 
 run_km <- function(data) {
   cat("\n[Step 1] Kaplan-Meier\n")
   train <- data$train
@@ -63,7 +63,7 @@ run_km <- function(data) {
 }
 
 
-# ---- Step 2: Univariate Cox ----
+# Step 2: Univariate Cox h(t)=h0(t) * exp(beta * feature)
 run_univariate <- function(data) {
   cat("\n[Step 2] Univariate Cox screening\n")
   train <- data$train
@@ -91,7 +91,7 @@ run_univariate <- function(data) {
 }
 
 
-# ---- Step 3: P-value filter ----
+# Step 3: P-value filter
 pvalue_filter <- function(uni_df, data, alpha=0.1) {
   cat(sprintf("\n[Step 3] P-value filter (alpha=%g)\n", alpha))
   selected <- union(uni_df$feature[uni_df$p_value < alpha], data$clinical_feats)
@@ -100,7 +100,7 @@ pvalue_filter <- function(uni_df, data, alpha=0.1) {
 }
 
 
-# ---- Step 4: Penalized Cox ----
+# Step 4: Penalized Cox
 run_penalized_cox <- function(data, candidate_feats) {
   cat("\n[Step 4] Penalized Cox models\n")
   x <- data$X_train[, candidate_feats]
@@ -167,7 +167,7 @@ run_penalized_cox <- function(data, candidate_feats) {
 }
 
 
-# ---- Step 5: Bayesian Cox (Laplace prior, MCMC) ----
+# Step 5: Bayesian Cox (Laplace prior, MCMC)
 log_partial_likelihood <- function(beta, X, time, status) {
   eta <- as.vector(X %*% beta)
   ll <- 0
@@ -243,24 +243,24 @@ run_bayesian_cox <- function(data, selected_feats,
   })
   cat(sprintf("Converged (R-hat<1.1): %d/%d\n", sum(rhat<1.1, na.rm=TRUE), p))
   
-  # Posterior summary
+  # Posterior summary — use 95% CI for selection
   combined <- do.call(rbind, chains)
   post_df <- data.frame(
-    feature  = selected_feats,
+    feature   = selected_feats,
     post_mean = colMeans(combined),
-    post_sd  = apply(combined, 2, sd),
-    ci_025   = apply(combined, 2, quantile, 0.025),
-    ci_975   = apply(combined, 2, quantile, 0.975),
-    HR       = exp(colMeans(combined)),
-    HR_ci025 = exp(apply(combined, 2, quantile, 0.025)),
-    HR_ci975 = exp(apply(combined, 2, quantile, 0.975)),
-    prob_pos = colMeans(combined > 0),
-    signif   = (apply(combined, 2, quantile, 0.025)>0) | (apply(combined, 2, quantile, 0.975)<0)
+    post_sd   = apply(combined, 2, sd),
+    ci_025    = apply(combined, 2, quantile, 0.025),
+    ci_975    = apply(combined, 2, quantile, 0.975),
+    HR        = exp(colMeans(combined)),
+    HR_ci025  = exp(apply(combined, 2, quantile, 0.025)),
+    HR_ci975  = exp(apply(combined, 2, quantile, 0.975)),
+    prob_pos  = colMeans(combined > 0),
+    signif    = (apply(combined, 2, quantile, 0.025)>0) | (apply(combined, 2, quantile, 0.975)<0)
   )
   cat(sprintf("Significant biomarkers (95%% CI excludes 0): %d\n", sum(post_df$signif)))
   print(post_df[post_df$signif, c("feature","HR","HR_ci025","HR_ci975","prob_pos")])
   
-  # Forest plot
+  # Forest plot — color by 80% CI significance
   fdf <- post_df %>% mutate(feature=reorder(feature, HR))
   pp <- ggplot(fdf, aes(x=HR, y=feature)) +
     geom_point(aes(color=signif), size=3) +
@@ -268,7 +268,8 @@ run_bayesian_cox <- function(data, selected_feats,
     geom_vline(xintercept=1, linetype="dashed", color="red") +
     scale_color_manual(values=c("TRUE"="#E24B4A","FALSE"="#888780")) +
     scale_x_log10() +
-    labs(title="Bayesian Cox: Hazard Ratios (95% CI)", x="HR (log scale)", y=NULL) +
+    labs(title="Bayesian Cox: Hazard Ratios (95% CI)",
+         x="HR (log scale)", y=NULL) +
     theme_minimal() + theme(legend.position="none")
   ggsave(file.path(FIGURES_DIR, "forest_plot.pdf"), pp, width=8, height=max(4, p*0.4))
   cat("Saved: forest_plot.pdf\n")
@@ -277,7 +278,7 @@ run_bayesian_cox <- function(data, selected_feats,
 }
 
 
-# ---- Step 6: Bootstrap stability ----
+# Step 6: Bootstrap stability
 run_stability <- function(data, penalized, n_boot=100) {
   cat(sprintf("\n[Step 6] Bootstrap stability (%d rounds)\n", n_boot))
   cand <- penalized$candidate_feats; pf <- penalized$pf
@@ -320,7 +321,7 @@ run_stability <- function(data, penalized, n_boot=100) {
 }
 
 
-# ---- Validation (inside run_all_plots) ----
+# Validation
 run_validation_plots <- function(data, penalized, bayes, bayes_feats) {
   # Lasso predictions
   lambda_pred <- penalized$lambda_opt
@@ -358,7 +359,7 @@ run_validation_plots <- function(data, penalized, bayes, bayes_feats) {
 }
 
 
-# ---- Main: compute & save ----
+# Main
 main <- function() {
   data <- load_data()
   run_km(data)
@@ -391,7 +392,7 @@ main <- function() {
   run_all_plots(results)
 }
 
-# ---- Re-plot without re-training ----
+# Re-plot without re-training
 run_all_plots <- function(results=NULL) {
   if (is.null(results)) {
     cat("Loading saved results...\n")
@@ -405,11 +406,13 @@ run_all_plots <- function(results=NULL) {
               length(results$penalized$lasso$selected),
               length(results$penalized$en_selected),
               length(results$penalized$alasso_selected)))
-  cat(sprintf("Bayesian significant: %d | Bootstrap stable: %d\n",
-              sum(results$bayes$post_df$signif), length(results$stability$stable)))
+  cat(sprintf("Bayesian significant (95%%): %d | Bootstrap stable: %d\n",
+              sum(results$bayes$post_df$signif),
+              length(results$stability$stable)))
   print(perf)
 }
 
 # Run
 main()
-# To re-plot only: run_all_plots()
+# To re-plot only
+# run_all_plots()

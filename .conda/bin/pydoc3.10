@@ -1,0 +1,5 @@
+#!/Users/chenyanzhen/Documents/DS4420_final_project-2/.conda/bin/python3.10
+
+import pydoc
+if __name__ == '__main__':
+    pydoc.cli()
